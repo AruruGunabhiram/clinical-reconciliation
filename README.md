@@ -1,16 +1,67 @@
 # Clinical Data Reconciliation Engine
 
-An AI-powered full-stack application that resolves conflicting medication records across healthcare systems and validates patient data quality using Anthropic Claude.
+A prototype that reconciles conflicting medication records pasted in from multiple sources, and scores patient-record data quality — with a deterministic rule engine as the floor and Anthropic Claude layered on top for clinical reasoning.
+
+The design question it answers: **where do you draw the line between a rule you can audit and a model you cannot?** Here, the deterministic reconciler always runs and always produces a complete answer. The LLM is an enhancement that can fail without taking the endpoint down.
+
+---
+
+## ⚠️ Scope and safety boundary
+
+Read this before anything else.
+
+This is a **take-home assessment prototype**, built in roughly 18 hours. It is explicitly **not**:
+
+| Not | Why it matters |
+|---|---|
+| Clinically validated | No clinician review, no trial, no evidence of correctness on real cases |
+| HIPAA compliant | No BAA, no audit controls, no encryption-at-rest guarantees, no access logging |
+| EHR-integrated | Records are typed into a web form by hand. Nothing is read from or written back to any EHR |
+| FHIR / HL7 connected | No healthcare interchange format is parsed or emitted |
+| A patient record system | Only approve/reject decisions are persisted. There is no durable patient store and no reconciliation history per patient |
+| Autonomous | Nothing acts on its own. Every result is presented to a human who approves or rejects it |
+| Production-ready | Static API key auth, single-instance in-memory cache, no tenancy, no rate limiting |
+
+Every example in this README uses **fictional, synthetic patient data**. Do not put real patient information into this application.
 
 ---
 
 ## Live Demo
-https://clinical-reconciliation.vercel.app
+
+A demo deployment of the frontend is at https://clinical-reconciliation.vercel.app — it exercises the same UI against a separately hosted backend. Availability is not guaranteed; run it locally (below) for a reliable walkthrough.
 
 | Route | URL |
 |---|---|
 | Medication Reconciliation | https://clinical-reconciliation.vercel.app/reconcile |
 | Data Quality Validation | https://clinical-reconciliation.vercel.app/validate |
+
+---
+
+## How it works
+
+```mermaid
+flowchart TD
+    A["Manual structured input<br/>(web form: sources, dosages, reliability, patient context)"] --> B["FastAPI route<br/>X-API-Key required"]
+    B --> C{"SHA-256 request cache<br/>5-min TTL, in-memory"}
+    C -->|hit| H
+    C -->|miss| D
+
+    subgraph DET["Deterministic layer — always runs"]
+        D["Rank sources by reliability + recency<br/>safety checks · confidence scoring<br/>conflict detection"]
+    end
+
+    D --> E{"Call Claude<br/>claude-sonnet-4-20250514"}
+    E -->|"structured JSON parsed OK"| F["LLM-reasoned result"]
+    E -->|"LLMParseError / AIServiceError"| G["Deterministic result<br/>used as fallback"]
+
+    F --> H["Response<br/>reconciled record · 0-1 confidence · reasoning<br/>conflicts · recommended actions · safety check"]
+    G --> H
+
+    H --> I["Human review in the UI<br/>Approve / Reject"]
+    I --> J[("Supabase<br/>decision + full output payload<br/>(optional)")]
+```
+
+The deterministic result is computed **before** the model is called, not as an error handler bolted on afterwards. If Claude is unavailable, returns malformed JSON, or the API key is missing, the endpoint still answers — with a traceable, rule-derived reconciliation rather than a 500.
 
 ---
 
@@ -24,16 +75,16 @@ https://clinical-reconciliation.vercel.app
 
 ## Features
 
-- **Medication reconciliation** — submit records from multiple sources (Hospital EHR, Clinic, Pharmacy, Patient Portal) and get a single reconciled medication with clinical reasoning
+- **Medication reconciliation** — enter records from several sources by hand, labelling each with its origin (Hospital EHR, Clinic, Pharmacy, Patient Portal) and a reliability level; get one reconciled medication back with the reasoning behind it. The labels are user-supplied metadata, not live connections to those systems
 - **Patient data quality validation** — score a patient record across completeness, accuracy, timeliness, and clinical plausibility; surface specific issues with severity levels
 - **Confidence scoring** — every reconciliation result includes a 0–1 confidence score visualised as a ring chart
-- **Approve / Reject workflow** — clinicians can approve or reject AI suggestions; decisions are persisted to Supabase and reflected as live counters in the navbar
-- **In-memory LRU caching** — identical requests skip the LLM entirely, returning cached results within the TTL
+- **Approve / Reject workflow** — a human reviewer approves or rejects each suggestion; the decision and the full model output payload are persisted to Supabase and reflected as live counters in the navbar. Nothing is acted on without this step
+- **In-memory response cache** — a plain dict keyed by the SHA-256 of the request body, evicting on a 5-minute TTL. Identical requests skip the LLM entirely. Process-local and lost on restart
 - **API key authentication** — all backend routes require an `X-API-Key` header
 
 ---
 
-## Architecture
+## Repository structure
 
 ```
 clinical-reconciliation/
@@ -44,7 +95,7 @@ clinical-reconciliation/
 │   ├── llm/                  # Anthropic client, prompt templates, parser
 │   ├── schemas/              # Pydantic request/response models
 │   ├── config.py             # Env var loading via python-dotenv
-│   └── tests/                # 34 pytest tests (unit + integration)
+│   └── tests/                # 55 pytest tests (unit + integration)
 ├── frontend/                 # React SPA (port 3000 prod / 5173 dev)
 │   ├── src/pages/            # ReconcilePage, ValidatePage
 │   ├── src/components/       # Navbar, forms, result cards, shared UI
@@ -228,7 +279,7 @@ source venv/bin/activate
 pytest tests/ -v
 ```
 
-The suite has 34 tests covering:
+The suite has **55 tests, all passing** (verified in this workspace with `pytest tests/ -q`). Coverage:
 - Input validation (missing fields, invalid enums, empty arrays)
 - Auth middleware (missing key, wrong key, valid key)
 - LLM client retry logic and error handling
@@ -251,7 +302,7 @@ FastAPI gives automatic OpenAPI docs, native async, and Pydantic v2 validation i
 The quality scorer runs rule-based checks (physiologically impossible vitals, stale dates, empty allergy lists) before calling the LLM. This means common issues are caught instantly without an API round-trip and the LLM focuses on cases that require clinical reasoning.
 
 **In-memory caching instead of Redis**
-A SHA-256-keyed dict with a 5-minute TTL is sufficient for a single-instance deployment and keeps the setup to zero external dependencies. The trade-off is cache loss on restart and no sharing across instances — both acceptable for an assessment scope.
+A SHA-256-keyed dict with a 5-minute TTL is sufficient for a single-instance deployment and keeps the setup to zero external dependencies. The trade-offs are cache loss on restart, no sharing across instances, and no size bound — all acceptable at assessment scope, all disqualifying beyond it.
 
 ---
 
@@ -272,7 +323,7 @@ A SHA-256-keyed dict with a 5-minute TTL is sufficient for a single-instance dep
 | Backend (routes, services, schemas)  | ~5 hrs   |
 | LLM integration, prompts, parser     | ~2 hrs   |
 | Auth middleware + caching            | ~1 hr    |
-| Tests (34 tests)                     | ~3 hrs   |
+| Tests                                | ~3 hrs   |
 | Frontend (React, Tailwind, UI)       | ~4 hrs   |
 | Docker setup                         | ~1 hr    |
 | Supabase approve/reject integration  | ~1 hr    |
